@@ -3,7 +3,13 @@ import subprocess
 import time
 
 
-def read_dump(addr, len):
+DMA_SRC = 0x60a0
+DMA_DST = 0x60a4
+DMA_SIZE = 0x60a8
+DMA_CTRL = 0x60ac
+
+
+def raw_read_dump(addr, len):
     """Read ap1302 registers
 
     The sysfs interface of the ap1302 driver has a 'dump' function but it writes the hexa dump
@@ -28,10 +34,10 @@ def read_dump(addr, len):
     return resp
 
 
-def read_uint16(addr):
+def raw_read_uint16(addr):
     """Read 16-bit ap1302 register value at given address
     """
-    resp = read_dump(addr, 2)
+    resp = raw_read_dump(addr, 2)
     reg = None
     if resp:
         reg = 0
@@ -41,10 +47,10 @@ def read_uint16(addr):
     return reg
 
 
-def read_reg32(addr):
+def raw_read_uint32(addr):
     """Read 32-bit ap1302 register value at given address
     """
-    resp = read_dump(addr, 4)
+    resp = raw_read_dump(addr, 4)
     reg = None
     if resp:
         reg = 0
@@ -54,14 +60,14 @@ def read_reg32(addr):
     return reg
 
 
-def read_int16(addr):
-    reg = read_uint16(addr)
+def raw_read_int16(addr):
+    reg = raw_read_uint16(addr)
     if reg > 32767:
         reg -= 65536
     return reg
 
 
-def write_reg16(addr, val):
+def raw_write_reg16(addr, val):
     """Write 16-bit ap1302 register through the sysfs interface
 
     Args:
@@ -73,45 +79,86 @@ def write_reg16(addr, val):
         f.write("0x%04x 0x%04x" % (addr, val))
 
 
-# read out ooriginal value from 0x3126
-orig_3126 = read_uint16(0x3126)
-print(f'orig_3126: {hex(orig_3126)}')
+def raw_write_reg32(addr, val):
+    """Write 32-bit ap1302 register through the sysfs interface
 
-# write 0 to 0x3126
-write_reg16(0x3126, 0)
-time.sleep(1)
-
-# write 0x001 to 0x3126 and read out 0x3124
-write_reg16(0x3126, 0x0001)
-tempsense_data = read_int16(0x3124)
-print(f'0x3124 after 0x0001: {hex(tempsense_data)}')
-time.sleep(0.5)
-
-# write 0x021 to 0x3126 and read out 0x3124
-write_reg16(0x3126, 0x0021)
-tempsense_data = read_int16(0x3124)
-print(f'0x3124 after 0x0021: {hex(tempsense_data)}')
-time.sleep(0.5)
-
-# write 0x011 to 0x3126 and read out 0x3124
-write_reg16(0x3126, 0x0011)
-tempsense_data = read_int16(0x3124)
-print(f'0x3124 after 0x0011: {hex(tempsense_data)}')
-time.sleep(0.2)
-tempsense_data = read_int16(0x3124)
-print(f'0x3124 after 0x0011: {hex(tempsense_data)}')
-time.sleep(0.2)
-
-ref60 = read_uint16(0x3128)
-print(f'ref60: {ref60}')
-
-unit = 1.443137
-offset = ref60 - unit*60
-print(f'offset: {offset}')
-
-temperature = (tempsense_data - offset)/unit
-print(f'temperature: {temperature}')
+    Args:
+        addr (int): address of register
+        val (int): register value
+    """
+    with open("/sys/devices/platform/soc/40013000.i2c/i2c-1/1-003d/write_reg32",
+              "w") as f:
+        f.write("0x%04x 0x%08x" % (addr, val))
 
 
-# write back original value
-write_reg16(0x3126, orig_3126)
+def dma_wait_ready():
+    """Wait for ap1302 DMA to be ready
+    """
+    while True:
+        if not (raw_read_uint16(DMA_CTRL) & 0x07):
+            break
+
+
+def sensor_read_uint16(addr):
+    """Read sensor register using ap1302 DMA
+
+    Args:
+        addr (int): address of sensor register
+    """
+    dma_wait_ready()
+    i2c_addr = raw_read_uint16(0x00d2)
+
+    raw_write_reg32(DMA_SRC, (i2c_addr << 16) + addr)
+    raw_write_reg32(DMA_DST, DMA_DST)
+    raw_write_reg32(DMA_SIZE, 2)
+
+    # start the write
+    raw_write_reg16(DMA_CTRL, 0x032)
+    dma_wait_ready()
+
+    return raw_read_uint16(DMA_DST)
+
+
+def sensor_write_uint16(addr, val):
+    """Write sensor register using ap1302 DMA
+
+    Args:
+        addr (int): address of sensor register
+        val (int): 16-bit value to be written
+    """
+    dma_wait_ready()
+    i2c_addr = raw_read_uint16(0x00d2)
+
+    raw_write_reg32(DMA_SRC, val)
+    raw_write_reg32(DMA_DST, (i2c_addr << 16) + addr)
+    raw_write_reg32(DMA_SIZE, 2)
+
+    # start the write
+    raw_write_reg16(DMA_CTRL, 0x0301)
+    dma_wait_ready()
+
+
+if __name__ == '__main__':
+    chip_id = sensor_read_uint16(0x3000)
+    print(f'Sensor_ID: {hex(chip_id)}')
+
+    # power on tempsens
+    sensor_write_uint16(0x3126, 0x1)
+
+    # clear tempsens_data
+    sensor_write_uint16(0x3126, 0x21)
+
+    # start temperature conversion and read tempsens_data
+    sensor_write_uint16(0x3126, 0x11)
+    time.sleep(0.5)
+    tempsens_data = sensor_read_uint16(0x3124)
+
+    # power down temperature sensor
+    sensor_write_uint16(0x3126, 0)
+
+    ref60 = sensor_read_uint16(0x3128)
+    unit = 1.443137
+    offset = ref60 - unit * 60
+    temperature = (tempsens_data - offset)/unit
+
+    print(f'temperature: {temperature}')
